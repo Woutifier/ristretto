@@ -42,12 +42,14 @@ type bucket map[uint64]uint64
 // expirationMap is a map of bucket number to the corresponding bucket.
 type expirationMap struct {
 	sync.RWMutex
-	buckets map[int64]bucket
+	buckets              map[int64]bucket
+	lastCleanedBucketNum int64
 }
 
 func newExpirationMap() *expirationMap {
 	return &expirationMap{
-		buckets: make(map[int64]bucket),
+		buckets:              make(map[int64]bucket),
+		lastCleanedBucketNum: cleanupBucket(time.Now()),
 	}
 }
 
@@ -121,27 +123,35 @@ func (m *expirationMap) cleanup(store store, policy policy, onEvict itemCallback
 
 	m.Lock()
 	now := time.Now()
-	bucketNum := cleanupBucket(now)
-	keys := m.buckets[bucketNum]
-	delete(m.buckets, bucketNum)
+	currentBucketNum := cleanupBucket(now)
+	// Clean up all buckets up to and including currentBucketNum, starting from
+	// (but not including) the last one that was cleaned up
+	var buckets []bucket
+	for bucketNum := m.lastCleanedBucketNum + 1; bucketNum <= currentBucketNum; bucketNum++ {
+		buckets = append(buckets, m.buckets[bucketNum])
+		delete(m.buckets, bucketNum)
+	}
+	m.lastCleanedBucketNum = currentBucketNum
 	m.Unlock()
 
-	for key, conflict := range keys {
-		// Sanity check. Verify that the store agrees that this key is expired.
-		if store.Expiration(key).After(now) {
-			continue
-		}
+	for _, keys := range buckets {
+		for key, conflict := range keys {
+			// Sanity check. Verify that the store agrees that this key is expired.
+			if store.Expiration(key).After(now) {
+				continue
+			}
 
-		cost := policy.Cost(key)
-		policy.Del(key)
-		_, value := store.Del(key, conflict)
+			cost := policy.Cost(key)
+			policy.Del(key)
+			_, value := store.Del(key, conflict)
 
-		if onEvict != nil {
-			onEvict(&Item{Key: key,
-				Conflict: conflict,
-				Value:    value,
-				Cost:     cost,
-			})
+			if onEvict != nil {
+				onEvict(&Item{Key: key,
+					Conflict: conflict,
+					Value:    value,
+					Cost:     cost,
+				})
+			}
 		}
 	}
 }
